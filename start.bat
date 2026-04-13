@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul 2>&1
 title AutoBump - Disboard
 color 0D
 
@@ -26,7 +27,7 @@ if %errorlevel% neq 0 (
 :: Install deps if node_modules missing
 if not exist "node_modules" (
     echo [SETUP] Installing dependencies...
-    call npm install discord.js-selfbot-v13 dotenv
+    call npm install
     echo.
 )
 

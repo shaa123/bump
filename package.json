@@ -1,0 +1,13 @@
+{
+  "name": "bump",
+  "version": "1.0.0",
+  "description": "AutoBump for Disboard",
+  "main": "bump.js",
+  "scripts": {
+    "start": "node bump.js"
+  },
+  "dependencies": {
+    "discord.js-selfbot-v13": "^3.7.1",
+    "dotenv": "^16.4.7"
+  }
+}
