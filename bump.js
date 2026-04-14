@@ -322,12 +322,6 @@ client.on("ready", async () => {
     log(`😴 Sleep hours: ${config.sleepHours.start}:00 - ${config.sleepHours.end}:00`);
   }
 
-  // Start dashboard
-  if (config.dashboard.enabled) {
-    startDashboard(state, config, config.dashboard.port);
-    log(`🌸 Dashboard running at http://localhost:${config.dashboard.port}`);
-  }
-
   await bumpAll();
   scheduleNext();
 });
@@ -358,6 +352,15 @@ function gracefulShutdown(signal) {
 
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+
+// ── Start dashboard before login ────────────────────────
+if (config.dashboard.enabled) {
+  try {
+    startDashboard(state, config, config.dashboard.port);
+  } catch (err) {
+    console.error(`[Dashboard] Failed to start: ${err.message}`);
+  }
+}
 
 client.login(TOKEN).catch((err) => {
   log(`❌ Login failed: ${err.message}`);

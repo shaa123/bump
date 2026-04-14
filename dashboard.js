@@ -28,7 +28,17 @@ function startDashboard(state, config, port) {
     }
   });
 
-  server.listen(port, () => {});
+  server.on("error", (err) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(`[Dashboard] Port ${port} is already in use. Try a different port in config.json`);
+    } else {
+      console.error(`[Dashboard] Server error: ${err.message}`);
+    }
+  });
+
+  server.listen(port, "0.0.0.0", () => {
+    console.log(`[Dashboard] Running at http://localhost:${port}`);
+  });
   return server;
 }
 
