@@ -1,65 +1,282 @@
 require("dotenv").config();
 const { Client } = require("discord.js-selfbot-v13");
 const fs = require("fs");
+const https = require("https");
+
+// ── Config ──────────────────────────────────────────────
+const DEFAULT_CONFIG = {
+  channels: [],
+  bumpIntervalMinutes: 120,
+  jitterMinMinutes: 1,
+  jitterMaxMinutes: 5,
+  typingDelayMs: [1000, 3000],
+  sleepHours: { enabled: false, start: 1, end: 7 },
+  logRotation: { maxSizeMB: 5 },
+  webhook: { enabled: false, url: "" },
+  maxConsecutiveFailures: 3,
+};
+
+let config;
+try {
+  const raw = fs.readFileSync("config.json", "utf8");
+  const user = JSON.parse(raw);
+  config = {
+    ...DEFAULT_CONFIG,
+    ...user,
+    sleepHours: { ...DEFAULT_CONFIG.sleepHours, ...(user.sleepHours || {}) },
+    logRotation: { ...DEFAULT_CONFIG.logRotation, ...(user.logRotation || {}) },
+    webhook: { ...DEFAULT_CONFIG.webhook, ...(user.webhook || {}) },
+    typingDelayMs: Array.isArray(user.typingDelayMs) && user.typingDelayMs.length === 2
+      ? user.typingDelayMs
+      : DEFAULT_CONFIG.typingDelayMs,
+  };
+} catch {
+  config = { ...DEFAULT_CONFIG };
+}
+
+// Ensure jitterMin <= jitterMax
+if (config.jitterMinMinutes > config.jitterMaxMinutes) {
+  const tmp = config.jitterMinMinutes;
+  config.jitterMinMinutes = config.jitterMaxMinutes;
+  config.jitterMaxMinutes = tmp;
+}
 
 const client = new Client();
-
-const CHANNEL_ID = process.env.CHANNEL_ID;
 const TOKEN = process.env.TOKEN;
 const DISBOARD_ID = "302050872383242240";
+const consecutiveFailures = {};
+let shuttingDown = false;
 
+// ── Validation ──────────────────────────────────────────
 if (!TOKEN || TOKEN === "paste_your_token_here") {
   console.error("[ERROR] TOKEN is not set. Edit your .env file with a valid Discord token.");
   process.exit(1);
 }
 
-if (!CHANNEL_ID) {
-  console.error("[ERROR] CHANNEL_ID is not set. Edit your .env file with a valid channel ID.");
-  process.exit(1);
+// Backwards compat: fall back to CHANNEL_ID from .env if config has no channels
+if (!Array.isArray(config.channels) || config.channels.length === 0) {
+  const envChannel = process.env.CHANNEL_ID;
+  if (!envChannel || envChannel === "paste_your_channel_id_here") {
+    console.error(
+      "[ERROR] No channels configured. Add channels to config.json or set CHANNEL_ID in .env"
+    );
+    process.exit(1);
+  }
+  config.channels = [envChannel];
 }
 
-// 2 hours + random 1-5 min jitter so it looks human
-const BUMP_INTERVAL = 2 * 60 * 60 * 1000;
-const JITTER = () => Math.floor(Math.random() * 4 * 60 * 1000) + 1 * 60 * 1000;
-
+// ── Logging with rotation ───────────────────────────────
 function log(msg) {
   const time = new Date().toLocaleString();
   const line = `[${time}] ${msg}`;
   console.log(line);
-  fs.appendFileSync("bump_log.txt", line + "\n");
-}
 
-async function bump() {
   try {
-    const channel = await client.channels.fetch(CHANNEL_ID);
-    await channel.sendSlash(DISBOARD_ID, "bump");
-    log("✅ Bump command sent.");
+    const logFile = "bump_log.txt";
+    const oldFile = "bump_log.old.txt";
+    const maxBytes = config.logRotation.maxSizeMB * 1024 * 1024;
+
+    if (fs.existsSync(logFile)) {
+      const stats = fs.statSync(logFile);
+      if (stats.size >= maxBytes) {
+        if (fs.existsSync(oldFile)) fs.unlinkSync(oldFile);
+        fs.renameSync(logFile, oldFile);
+      }
+    }
+    fs.appendFileSync(logFile, line + "\n");
   } catch (err) {
-    log(`❌ Bump failed: ${err.message}`);
+    console.error(`Log write error: ${err.message}`);
   }
 }
 
-async function scheduleNext() {
-  const wait = BUMP_INTERVAL + JITTER();
+// ── Webhook alerts ──────────────────────────────────────
+function sendWebhook(message) {
+  if (!config.webhook.enabled || !config.webhook.url) return;
+
+  try {
+    const url = new URL(config.webhook.url);
+    const payload = JSON.stringify({
+      content: message,
+      username: "AutoBump Alert",
+    });
+
+    const req = https.request({
+      hostname: url.hostname,
+      port: url.port || 443,
+      path: url.pathname + url.search,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(payload),
+      },
+    });
+    req.on("error", () => {}); // silently ignore webhook errors
+    req.write(payload);
+    req.end();
+  } catch {
+    // silently ignore
+  }
+}
+
+// ── Sleep hours ─────────────────────────────────────────
+function isDuringSleepHours() {
+  if (!config.sleepHours.enabled) return false;
+  const hour = new Date().getHours();
+  const { start, end } = config.sleepHours;
+  if (start <= end) {
+    return hour >= start && hour < end;
+  }
+  // Wraps past midnight (e.g. start:23, end:7 = sleep 11pm-7am)
+  return hour >= start || hour < end;
+}
+
+// ── Disboard response listener ──────────────────────────
+function waitForDisboardResponse(channel, timeoutMs) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      client.off("messageCreate", handler);
+      resolve(null);
+    }, timeoutMs);
+
+    const handler = (msg) => {
+      const isDisboard =
+        msg.author?.id === DISBOARD_ID || msg.applicationId === DISBOARD_ID;
+      if (msg.channel.id === channel.id && isDisboard) {
+        clearTimeout(timer);
+        client.off("messageCreate", handler);
+        resolve(msg);
+      }
+    };
+
+    client.on("messageCreate", handler);
+  });
+}
+
+// ── Bump a single channel ───────────────────────────────
+async function bumpChannel(channelId) {
+  try {
+    const channel = await client.channels.fetch(channelId);
+
+    // Typing delay to look human
+    const [minDelay, maxDelay] = config.typingDelayMs;
+    const delay = Math.floor(Math.random() * (maxDelay - minDelay)) + minDelay;
+    await new Promise((r) => setTimeout(r, delay));
+
+    await channel.sendSlash(DISBOARD_ID, "bump");
+    log(`[${channelId}] Bump command sent, awaiting response...`);
+
+    // Wait up to 15s for Disboard to respond
+    const response = await waitForDisboardResponse(channel, 15000);
+
+    if (!response) {
+      log(`[${channelId}] ⚠️ No response from Disboard within 15s`);
+      return { success: false, retryAfterMs: null };
+    }
+
+    // Parse response (embeds + content)
+    const content = (response.content || "").toLowerCase();
+    const embedDesc = (response.embeds?.[0]?.description || "").toLowerCase();
+    const text = content + " " + embedDesc;
+
+    if (text.includes("bump done")) {
+      log(`[${channelId}] ✅ Bump confirmed by Disboard!`);
+      return { success: true, retryAfterMs: null };
+    }
+
+    const cooldownMatch = text.match(/(\d+)\s*minute/);
+    if (cooldownMatch) {
+      const waitMin = parseInt(cooldownMatch[1], 10);
+      log(`[${channelId}] ⏳ Cooldown: ${waitMin} minutes remaining`);
+      // Retry 1 minute after cooldown expires
+      return { success: false, retryAfterMs: (waitMin + 1) * 60 * 1000 };
+    }
+
+    log(`[${channelId}] ⚠️ Unknown Disboard response`);
+    return { success: false, retryAfterMs: null };
+  } catch (err) {
+    log(`[${channelId}] ❌ Bump failed: ${err.message}`);
+    return { success: false, retryAfterMs: null };
+  }
+}
+
+// ── Bump all channels ───────────────────────────────────
+async function bumpAll() {
+  if (isDuringSleepHours()) {
+    log("😴 Sleep hours active, skipping this bump cycle");
+    return;
+  }
+
+  for (let i = 0; i < config.channels.length; i++) {
+    const channelId = config.channels[i];
+    const result = await bumpChannel(channelId);
+
+    if (result.success) {
+      consecutiveFailures[channelId] = 0;
+    } else {
+      consecutiveFailures[channelId] = (consecutiveFailures[channelId] || 0) + 1;
+
+      // Auto-retry on cooldown
+      if (result.retryAfterMs) {
+        const retryMin = Math.floor(result.retryAfterMs / 60000);
+        log(`[${channelId}] 🔄 Auto-retry in ${retryMin} minutes`);
+        setTimeout(async () => {
+          try {
+            await bumpChannel(channelId);
+          } catch (err) {
+            log(`[${channelId}] ❌ Retry failed: ${err.message}`);
+          }
+        }, result.retryAfterMs);
+      }
+
+      // Alert on repeated failures
+      if (consecutiveFailures[channelId] >= config.maxConsecutiveFailures) {
+        const msg = `⚠️ Channel ${channelId}: ${consecutiveFailures[channelId]} consecutive failures`;
+        log(msg);
+        sendWebhook(msg);
+      }
+    }
+
+    // 3s delay between channels to avoid rate limits
+    if (i < config.channels.length - 1) {
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
+}
+
+// ── Scheduling ──────────────────────────────────────────
+function getJitterMs() {
+  const minMs = config.jitterMinMinutes * 60 * 1000;
+  const maxMs = config.jitterMaxMinutes * 60 * 1000;
+  return Math.floor(Math.random() * (maxMs - minMs)) + minMs;
+}
+
+function scheduleNext() {
+  const wait = config.bumpIntervalMinutes * 60 * 1000 + getJitterMs();
   const minutes = Math.floor(wait / 60000);
   log(`⏰ Next bump in ${minutes} minutes...`);
 
   setTimeout(async () => {
     try {
-      await bump();
+      await bumpAll();
     } catch (err) {
-      log(`❌ Unexpected error during bump: ${err.message}`);
+      log(`❌ Unexpected error during bump cycle: ${err.message}`);
     }
     scheduleNext();
   }, wait);
 }
 
+// ── Client events ───────────────────────────────────────
 client.on("ready", async () => {
   log(`🟢 Logged in as ${client.user.tag}`);
-  log(`📍 Bump channel: ${CHANNEL_ID}`);
+  log(`📍 Channels: ${config.channels.join(", ")}`);
+  log(
+    `⏱️  Interval: ${config.bumpIntervalMinutes}min + ${config.jitterMinMinutes}-${config.jitterMaxMinutes}min jitter`
+  );
+  if (config.sleepHours.enabled) {
+    log(`😴 Sleep hours: ${config.sleepHours.start}:00 - ${config.sleepHours.end}:00`);
+  }
 
-  // bump immediately on start, then schedule
-  await bump();
+  await bumpAll();
   scheduleNext();
 });
 
@@ -67,17 +284,27 @@ client.on("error", (err) => {
   log(`❌ Client error: ${err.message}`);
 });
 
+// ── Error handling & graceful shutdown ───────────────────
 process.on("unhandledRejection", (err) => {
-  log(`❌ Unhandled rejection: ${err.message}`);
+  log(`❌ Unhandled rejection: ${err && err.message ? err.message : err}`);
 });
 
 process.on("uncaughtException", (err) => {
   log(`💥 Crash: ${err.message}`);
   log("Exiting in 5 seconds (restart handled by start.bat)...");
-  setTimeout(() => {
-    process.exit(1);
-  }, 5000);
+  setTimeout(() => process.exit(1), 5000);
 });
+
+function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log(`${signal} received, shutting down...`);
+  client.destroy();
+  process.exit(0);
+}
+
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 
 client.login(TOKEN).catch((err) => {
   log(`❌ Login failed: ${err.message}`);

@@ -1,0 +1,20 @@
+{
+  "channels": [],
+  "bumpIntervalMinutes": 120,
+  "jitterMinMinutes": 1,
+  "jitterMaxMinutes": 5,
+  "typingDelayMs": [1000, 3000],
+  "sleepHours": {
+    "enabled": false,
+    "start": 1,
+    "end": 7
+  },
+  "logRotation": {
+    "maxSizeMB": 5
+  },
+  "webhook": {
+    "enabled": false,
+    "url": ""
+  },
+  "maxConsecutiveFailures": 3
+}
