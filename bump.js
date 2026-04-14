@@ -2,6 +2,7 @@ require("dotenv").config();
 const { Client } = require("discord.js-selfbot-v13");
 const fs = require("fs");
 const https = require("https");
+const { startDashboard } = require("./dashboard");
 
 // ── Config ──────────────────────────────────────────────
 const DEFAULT_CONFIG = {
@@ -14,6 +15,7 @@ const DEFAULT_CONFIG = {
   logRotation: { maxSizeMB: 5 },
   webhook: { enabled: false, url: "" },
   maxConsecutiveFailures: 3,
+  dashboard: { enabled: true, port: 3000 },
 };
 
 let config;
@@ -26,6 +28,7 @@ try {
     sleepHours: { ...DEFAULT_CONFIG.sleepHours, ...(user.sleepHours || {}) },
     logRotation: { ...DEFAULT_CONFIG.logRotation, ...(user.logRotation || {}) },
     webhook: { ...DEFAULT_CONFIG.webhook, ...(user.webhook || {}) },
+    dashboard: { ...DEFAULT_CONFIG.dashboard, ...(user.dashboard || {}) },
     typingDelayMs: Array.isArray(user.typingDelayMs) && user.typingDelayMs.length === 2
       ? user.typingDelayMs
       : DEFAULT_CONFIG.typingDelayMs,
@@ -44,8 +47,18 @@ if (config.jitterMinMinutes > config.jitterMaxMinutes) {
 const client = new Client();
 const TOKEN = process.env.TOKEN;
 const DISBOARD_ID = "302050872383242240";
-const consecutiveFailures = {};
 let shuttingDown = false;
+
+// ── Dashboard state ─────────────────────────────────────
+const state = {
+  bot: { online: false, tag: "", startedAt: null },
+  channels: {},
+  nextBumpAt: null,
+  log: [],
+  stats: { total: 0, success: 0, fail: 0 },
+};
+
+const MAX_LOG_ENTRIES = 100;
 
 // ── Validation ──────────────────────────────────────────
 if (!TOKEN || TOKEN === "paste_your_token_here") {
@@ -70,6 +83,12 @@ function log(msg) {
   const time = new Date().toLocaleString();
   const line = `[${time}] ${msg}`;
   console.log(line);
+
+  // Push to dashboard state
+  state.log.push(line);
+  if (state.log.length > MAX_LOG_ENTRIES) {
+    state.log.shift();
+  }
 
   try {
     const logFile = "bump_log.txt";
@@ -154,6 +173,15 @@ function waitForDisboardResponse(channel, timeoutMs) {
 
 // ── Bump a single channel ───────────────────────────────
 async function bumpChannel(channelId) {
+  // Init channel state if needed
+  if (!state.channels[channelId]) {
+    state.channels[channelId] = {
+      lastBumpAt: null,
+      lastResult: null,
+      consecutiveFailures: 0,
+    };
+  }
+
   try {
     const channel = await client.channels.fetch(channelId);
 
@@ -170,6 +198,8 @@ async function bumpChannel(channelId) {
 
     if (!response) {
       log(`[${channelId}] ⚠️ No response from Disboard within 15s`);
+      state.channels[channelId].lastBumpAt = Date.now();
+      state.channels[channelId].lastResult = "fail";
       return { success: false, retryAfterMs: null };
     }
 
@@ -180,6 +210,8 @@ async function bumpChannel(channelId) {
 
     if (text.includes("bump done")) {
       log(`[${channelId}] ✅ Bump confirmed by Disboard!`);
+      state.channels[channelId].lastBumpAt = Date.now();
+      state.channels[channelId].lastResult = "success";
       return { success: true, retryAfterMs: null };
     }
 
@@ -187,14 +219,20 @@ async function bumpChannel(channelId) {
     if (cooldownMatch) {
       const waitMin = parseInt(cooldownMatch[1], 10);
       log(`[${channelId}] ⏳ Cooldown: ${waitMin} minutes remaining`);
+      state.channels[channelId].lastBumpAt = Date.now();
+      state.channels[channelId].lastResult = "cooldown";
       // Retry 1 minute after cooldown expires
       return { success: false, retryAfterMs: (waitMin + 1) * 60 * 1000 };
     }
 
     log(`[${channelId}] ⚠️ Unknown Disboard response`);
+    state.channels[channelId].lastBumpAt = Date.now();
+    state.channels[channelId].lastResult = "fail";
     return { success: false, retryAfterMs: null };
   } catch (err) {
     log(`[${channelId}] ❌ Bump failed: ${err.message}`);
+    state.channels[channelId].lastBumpAt = Date.now();
+    state.channels[channelId].lastResult = "fail";
     return { success: false, retryAfterMs: null };
   }
 }
@@ -210,10 +248,13 @@ async function bumpAll() {
     const channelId = config.channels[i];
     const result = await bumpChannel(channelId);
 
+    state.stats.total++;
     if (result.success) {
-      consecutiveFailures[channelId] = 0;
+      state.stats.success++;
+      state.channels[channelId].consecutiveFailures = 0;
     } else {
-      consecutiveFailures[channelId] = (consecutiveFailures[channelId] || 0) + 1;
+      state.stats.fail++;
+      state.channels[channelId].consecutiveFailures++;
 
       // Auto-retry on cooldown
       if (result.retryAfterMs) {
@@ -229,8 +270,8 @@ async function bumpAll() {
       }
 
       // Alert on repeated failures
-      if (consecutiveFailures[channelId] >= config.maxConsecutiveFailures) {
-        const msg = `⚠️ Channel ${channelId}: ${consecutiveFailures[channelId]} consecutive failures`;
+      if (state.channels[channelId].consecutiveFailures >= config.maxConsecutiveFailures) {
+        const msg = `⚠️ Channel ${channelId}: ${state.channels[channelId].consecutiveFailures} consecutive failures`;
         log(msg);
         sendWebhook(msg);
       }
@@ -253,6 +294,7 @@ function getJitterMs() {
 function scheduleNext() {
   const wait = config.bumpIntervalMinutes * 60 * 1000 + getJitterMs();
   const minutes = Math.floor(wait / 60000);
+  state.nextBumpAt = Date.now() + wait;
   log(`⏰ Next bump in ${minutes} minutes...`);
 
   setTimeout(async () => {
@@ -267,6 +309,10 @@ function scheduleNext() {
 
 // ── Client events ───────────────────────────────────────
 client.on("ready", async () => {
+  state.bot.online = true;
+  state.bot.tag = client.user.tag;
+  state.bot.startedAt = Date.now();
+
   log(`🟢 Logged in as ${client.user.tag}`);
   log(`📍 Channels: ${config.channels.join(", ")}`);
   log(
@@ -274,6 +320,12 @@ client.on("ready", async () => {
   );
   if (config.sleepHours.enabled) {
     log(`😴 Sleep hours: ${config.sleepHours.start}:00 - ${config.sleepHours.end}:00`);
+  }
+
+  // Start dashboard
+  if (config.dashboard.enabled) {
+    startDashboard(state, config, config.dashboard.port);
+    log(`🌸 Dashboard running at http://localhost:${config.dashboard.port}`);
   }
 
   await bumpAll();
@@ -298,6 +350,7 @@ process.on("uncaughtException", (err) => {
 function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
+  state.bot.online = false;
   log(`${signal} received, shutting down...`);
   client.destroy();
   process.exit(0);

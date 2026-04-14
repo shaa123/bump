@@ -16,5 +16,9 @@
     "enabled": false,
     "url": ""
   },
-  "maxConsecutiveFailures": 3
+  "maxConsecutiveFailures": 3,
+  "dashboard": {
+    "enabled": true,
+    "port": 3000
+  }
 }
